@@ -11,6 +11,7 @@
 3. [Application Security Log (SOC Log)](#3-application-security-log-soc-log)
 4. [Cloud Agnostic Design – Adapter Layer](#4-cloud-agnostic-design--adapter-layer)
 5. [Security Requirements](#5-security-requirements)
+6. [Kubernetes Requirements](#6-kubernetes-requirements)
 
 ---
 
@@ -479,4 +480,130 @@ This section defines security requirements derived from the IT Security Requirem
 
 ---
 
-*Document version: 1.1 | Last updated: 2026-03-19*
+## 6. Kubernetes Requirements
+
+### Overview
+
+Applications deployed on Kubernetes MUST be configured to operate reliably and safely within a shared cluster environment. This section covers resource management, health probing, and graceful shutdown — all of which directly affect cluster stability, workload scheduling, and zero-downtime deployments.
+
+---
+
+### 6.1 Resource Requests and Limits
+
+Every container MUST declare both `resources.requests` and `resources.limits` in its pod spec. Without these, the scheduler cannot make informed placement decisions and a single runaway container can starve other workloads on the same node.
+
+- `requests` — the amount of CPU/memory the scheduler reserves for the container. Used for node placement.
+- `limits` — the hard ceiling the container is never allowed to exceed. Breaching the memory limit causes the container to be OOM-killed; breaching the CPU limit causes throttling.
+
+#### Requirements
+
+- **[MUST]** Every container MUST declare `resources.requests.cpu` and `resources.requests.memory`.
+- **[MUST]** Every container MUST declare `resources.limits.cpu` and `resources.limits.memory`.
+- **[MUST NOT]** CPU and memory limits MUST NOT be left unset. Containers without limits can consume unbounded resources and destabilize the node.
+- **[SHOULD]** Set `requests` as close as possible to the actual observed usage. Over-requesting wastes cluster capacity; under-requesting risks OOM kills.
+- **[SHOULD]** Keep the ratio of `limits` to `requests` reasonable (recommended: limits ≤ 2× requests for memory to avoid burstable-tier instability).
+
+#### Example
+
+```yaml
+resources:
+  requests:
+    cpu: "250m"       # 0.25 vCPU reserved for scheduling
+    memory: "256Mi"   # 256 MiB reserved for scheduling
+  limits:
+    cpu: "500m"       # hard cap at 0.5 vCPU (throttled if exceeded)
+    memory: "512Mi"   # hard cap at 512 MiB (OOM-killed if exceeded)
+```
+
+> **Note on units:** CPU is expressed in millicores (`m`); `1000m` = 1 vCPU. Memory uses binary suffixes: `Mi` (mebibytes), `Gi` (gibibytes).
+
+---
+
+### 6.2 Liveness Probe and Readiness Probe
+
+Kubernetes uses probes to determine the health of a container. Without them, the platform cannot detect a hung process, route traffic safely, or perform rolling updates without causing errors.
+
+| Probe | Purpose | Action on failure |
+|---|---|---|
+| **Liveness** | Detects if the container is stuck / deadlocked and needs a restart | Container is restarted by kubelet |
+| **Readiness** | Detects if the container is ready to accept traffic | Pod is removed from Service endpoints (no traffic sent) |
+
+#### Requirements
+
+- **[MUST]** Every container MUST define a `livenessProbe`.
+- **[MUST]** Every container that serves traffic MUST define a `readinessProbe`.
+- **[MUST]** The liveness probe endpoint MUST reflect whether the process is alive and not deadlocked. It MUST NOT call downstream dependencies — a dependency failure should not restart the container.
+- **[MUST]** The readiness probe endpoint MUST reflect whether the container is fully initialised and ready to handle requests (e.g., DB connections established, caches warmed).
+- **[SHOULD]** Set `initialDelaySeconds` to give the application enough time to start before the first probe fires, avoiding unnecessary restarts during startup.
+- **[SHOULD]** Prefer an HTTP `GET` probe over a TCP check when the application exposes an HTTP endpoint, as it more accurately validates application-level health.
+
+#### Example
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /healthz/live    # lightweight check — is the process alive?
+    port: 8080
+  initialDelaySeconds: 15  # wait 15 s after container start before first check
+  periodSeconds: 20         # check every 20 s
+  failureThreshold: 3       # restart after 3 consecutive failures
+
+readinessProbe:
+  httpGet:
+    path: /healthz/ready   # deeper check — is the app ready for traffic?
+    port: 8080
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  failureThreshold: 3
+```
+
+> **Recommended practice:** Expose two separate endpoints — `/healthz/live` (liveness) and `/healthz/ready` (readiness) — so each can be independently lightweight or thorough as needed.
+
+---
+
+### 6.3 Graceful Shutdown
+
+When Kubernetes terminates a pod (during a rolling update, node drain, or scale-down), it sends `SIGTERM` to the container and waits for `terminationGracePeriodSeconds` before force-killing it with `SIGKILL`. Applications that do not handle `SIGTERM` drop in-flight requests and leave resources in an inconsistent state.
+
+#### Requirements
+
+- **[MUST]** Applications MUST handle the `SIGTERM` signal and begin an orderly shutdown sequence:
+  1. Stop accepting new requests (deregister from load balancer / Service endpoints via readiness probe returning unhealthy).
+  2. Finish processing all in-flight requests.
+  3. Release resources (close DB connections, flush buffers, complete pending writes).
+  4. Exit cleanly with a zero exit code.
+- **[MUST]** The `terminationGracePeriodSeconds` value in the pod spec MUST be set long enough to allow all in-flight requests to complete. The default (30 s) is often insufficient for long-running jobs.
+- **[MUST NOT]** Applications MUST NOT exit immediately on `SIGTERM` without draining in-flight work.
+- **[SHOULD]** Background workers and batch jobs MUST checkpoint their progress before shutdown so that work can be resumed, not restarted from scratch, after a restart.
+
+#### Example
+
+```yaml
+spec:
+  terminationGracePeriodSeconds: 60   # give the app up to 60 s to shut down cleanly
+
+  containers:
+    - name: my-app
+      lifecycle:
+        preStop:
+          exec:
+            # Optional: sleep briefly to allow the Service endpoint removal
+            # to propagate before the app stops accepting connections
+            command: ["/bin/sh", "-c", "sleep 5"]
+```
+
+Application-side (example in Go):
+
+```go
+quit := make(chan os.Signal, 1)
+signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
+<-quit                          // block until signal received
+
+ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+defer cancel()
+server.Shutdown(ctx)            // stop accepting new requests, drain existing ones
+```
+
+---
+
+*Document version: 1.2 | Last updated: 2026-03-20*
